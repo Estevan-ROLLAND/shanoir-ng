@@ -23,9 +23,8 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.function.IntConsumer;
 import java.util.stream.IntStream;
-
-import javax.swing.JProgressBar;
 
 import org.apache.commons.lang3.StringUtils;
 import org.dcm4che3.data.Attributes;
@@ -249,7 +248,7 @@ public class QueryPACSService {
         LOG.debug("------------------------------");
     }
 
-    public void queryCMOVEs(String studyInstanceUID, List<Serie> selectedSeries, JProgressBar progressBar) throws Exception {
+    public void queryCMOVEs(String studyInstanceUID, List<Serie> selectedSeries, IntConsumer progressCallback) throws Exception {
         LOG.info("--------------------");
         LOG.info("--- START C-MOVES --");
         LOG.info("--------------------");
@@ -262,7 +261,7 @@ public class QueryPACSService {
             serieNumber++;
             queryCMOVEPerSerie(studyInstanceUID, serie, association);
             totalPercent = Math.round(((float) serieNumber / numberOfSeries) * 100);
-            progressBar.setValue(totalPercent);
+            progressCallback.accept(totalPercent);
         }
         releaseAssociation(association);
         long finish = System.currentTimeMillis();

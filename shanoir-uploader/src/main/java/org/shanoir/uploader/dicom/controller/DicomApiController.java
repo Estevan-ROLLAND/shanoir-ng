@@ -3,25 +3,31 @@ package org.shanoir.uploader.dicom.controller;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.locks.Lock;
 
+import org.shanoir.ng.importer.dicom.ImagesCreatorAndDicomFileAnalyzerService;
+import org.shanoir.ng.importer.model.ImportJob;
+import org.shanoir.ng.importer.model.ImportJobStatus;
 import org.shanoir.ng.importer.model.Patient;
-import org.shanoir.ng.importer.model.Serie;
-import org.shanoir.ng.importer.model.Study;
 import org.shanoir.uploader.ShUpConfig;
 import org.shanoir.uploader.ShUpOnloadConfig;
+import org.shanoir.uploader.action.DownloadOrCopyRunnable;
+import org.shanoir.uploader.action.FindDicomActionListener;
+import org.shanoir.uploader.action.ImportProgressListener;
 import org.shanoir.uploader.action.event.DicomClientReadyEvent;
 import org.shanoir.uploader.dicom.DicomServerClient;
-import org.shanoir.uploader.dicom.DicomTreeNode;
 import org.shanoir.uploader.dicom.dto.ConfigDTO;
 import org.shanoir.uploader.dicom.query.Media;
-import org.shanoir.uploader.dicom.query.PatientTreeNode;
-import org.shanoir.uploader.dicom.query.SerieTreeNode;
-import org.shanoir.uploader.dicom.query.StudyTreeNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationListener;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -38,7 +44,20 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
 
     private volatile DicomServerClient dicomServerClient;
 
+    private ImagesCreatorAndDicomFileAnalyzerService dicomFileAnalyzer;
+
     private static final Logger logger = LoggerFactory.getLogger(DicomApiController.class);
+
+    private final Lock importLock;
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    private final ConcurrentHashMap<String, ImportJobStatus> statusStore = new ConcurrentHashMap<>();
+
+    public DicomApiController(Lock importLock, ImagesCreatorAndDicomFileAnalyzerService dicomFileAnalyzer) {
+        this.importLock = importLock;
+        this.dicomFileAnalyzer = new ImagesCreatorAndDicomFileAnalyzerService();
+    }
 
     @Override
     public void onApplicationEvent(DicomClientReadyEvent event) {
@@ -100,23 +119,9 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
 
     @PutMapping("/configuration")
     public void updateDicomConfiguration(@RequestBody ConfigDTO config) {
-        ShUpConfig.dicomServerProperties.setProperty("dicom.server.host", config.getDistantDicomServer().getHost());
-        ShUpConfig.dicomServerProperties.setProperty("dicom.server.port", String.valueOf(config.getDistantDicomServer().getPort()));
-        ShUpConfig.dicomServerProperties.setProperty("dicom.server.aet.called", config.getDistantDicomServer().getAet());
-        ShUpConfig.dicomServerProperties.setProperty("local.dicom.server.host", config.getLocalDicomServer().getHost());
-        ShUpConfig.dicomServerProperties.setProperty("local.dicom.server.port", String.valueOf(config.getLocalDicomServer().getPort()));
-        ShUpConfig.dicomServerProperties.setProperty("local.dicom.server.aet.calling", config.getLocalDicomServer().getAet());
-
-        Properties props = ShUpConfig.dicomServerProperties;
-        props.setProperty("dicom.server.host", config.getDistantDicomServer().getHost());
-        props.setProperty("dicom.server.port", String.valueOf(config.getDistantDicomServer().getPort()));
-        props.setProperty("dicom.server.aet.called", config.getDistantDicomServer().getAet());
-        props.setProperty("local.dicom.server.host", config.getLocalDicomServer().getHost());
-        props.setProperty("local.dicom.server.port", String.valueOf(config.getLocalDicomServer().getPort()));
-        props.setProperty("local.dicom.server.aet.calling", config.getLocalDicomServer().getAet());
-
+        setDicomProperties(ShUpConfig.dicomServerProperties, config);
         try (FileOutputStream fos = new FileOutputStream(ShUpConfig.shanoirUploaderFolder + File.separator + ShUpConfig.DICOM_SERVER_PROPERTIES)) {
-            props.store(fos, "Updated by user");
+            ShUpConfig.dicomServerProperties.store(fos, "Updated by user");
             logger.info("Dicom server properties updated by user");
         } catch (Exception e) {
             logger.error("Error updating Dicom configuration", e);
@@ -128,41 +133,70 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
         logger.info("Querying Dicom server with parameters: {}", queryParameters);
 
         List<Patient> patients = getClient().queryDicomServer(Objects.equals(queryParameters.get("studyRootQuery"), "true"), queryParameters.get("modality"), queryParameters.get("patientName"), queryParameters.get("patientID"), queryParameters.get("studyDescription"), queryParameters.get("patientBirthDate"), queryParameters.get("studyDate"));
-
         Media media = new Media();
-
         logger.info(patients.toString());
 
-        // content of function fillMediaWithPatients(Media media, final List<Patient> patients)
-        if (patients != null) {
-            for (Iterator patientsIt = patients.iterator(); patientsIt.hasNext();) {
-                Patient patient = (Patient) patientsIt.next();
-                final PatientTreeNode patientTreeNode = media.initChildTreeNode(patient);
-                logger.info("Patient info read: " + patient.toString());
-                // add patients
-                media.addTreeNode(patientTreeNode);
-                List<Study> studies = patient.getStudies();
-                for (Iterator studiesIt = studies.iterator(); studiesIt.hasNext();) {
-                    Study study = (Study) studiesIt.next();
-                    final StudyTreeNode studyTreeNode = patientTreeNode.initChildTreeNode(study);
-                    // add studies
-                    patientTreeNode.addTreeNode(studyTreeNode);
-                    List<Serie> series = study.getSeries();
-                    for (Iterator seriesIt = series.iterator(); seriesIt.hasNext();) {
-                        Serie serie = (Serie) seriesIt.next();
-                        if (!serie.isErroneous() && !serie.isIgnored()) {
-                            final SerieTreeNode serieTreeNode = studyTreeNode.initChildTreeNode(serie);
-                            // add series
-                            studyTreeNode.addTreeNode(serieTreeNode);
-                        }
-                    }
-                }
-            }
-            logger.info("Patients read from DICOM server: " + media.getTreeNodes().toString());
-            logger.info("Media : " + media.getData().toString());
-        }
+        FindDicomActionListener.fillMediaWithPatients(media, patients);
+        logger.info("Patients read from DICOM server: " + media.getTreeNodes().toString());
+        logger.info("Media : " + media.getData().toString());
 
         return media.getData();
+    }
+
+    @PostMapping("/retrieve")
+    public ResponseEntity<?> retrieveDicomSeries(@RequestBody ImportJob importJob) throws Exception {
+        // Lock to avoid concurrent queries in parallel
+        if (!importLock.tryLock()) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(Map.of("error", "A previous import is still running. Please wait until it is finished."));
+        }
+
+        String jobId = UUID.randomUUID().toString();
+        statusStore.put(jobId, new ImportJobStatus(0, "STARTED", null, false, false));
+
+        ImportProgressListener restListener = new ImportProgressListener() {
+            @Override
+            public void onProgress(int percentage, String currentStep) {
+                statusStore.put(jobId, new ImportJobStatus(percentage, currentStep, null, false, false));
+            }
+
+            @Override
+            public void onComplete(String reportSummary, boolean success) {
+                statusStore.put(jobId, new ImportJobStatus(100, "DONE", reportSummary, true, success));
+                importLock.unlock();
+            }
+        };
+
+        try {
+            Map<String, ImportJob> importJobs = Map.of(importJob.getStudy().getStudyInstanceUID(), importJob);
+            DownloadOrCopyRunnable runner = new DownloadOrCopyRunnable(
+                    importJob.isFromPacs(), dicomServerClient, dicomFileAnalyzer,
+                    null, importJobs, restListener);
+            executor.submit(runner);
+        } catch (Exception e) {
+            importLock.unlock();
+            logger.error("An error occured while running the thread.", e);
+            return ResponseEntity.internalServerError().build();
+        }
+    return ResponseEntity.accepted().body(Map.of("importJobId", jobId));
+    }
+
+    @GetMapping("/importJobs/{jobId}/progress")
+    public ResponseEntity<ImportJobStatus> getProgress(@PathVariable String jobId) {
+        ImportJobStatus status = statusStore.get(jobId);
+        if (status == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok(status);
+    }
+
+    private void setDicomProperties(Properties dicomServerProperties, ConfigDTO config) {
+        dicomServerProperties.setProperty("dicom.server.host", config.getDistantDicomServer().getHost());
+        dicomServerProperties.setProperty("dicom.server.port", String.valueOf(config.getDistantDicomServer().getPort()));
+        dicomServerProperties.setProperty("dicom.server.aet.called", config.getDistantDicomServer().getAet());
+        dicomServerProperties.setProperty("local.dicom.server.host", config.getLocalDicomServer().getHost());
+        dicomServerProperties.setProperty("local.dicom.server.port", String.valueOf(config.getLocalDicomServer().getPort()));
+        dicomServerProperties.setProperty("local.dicom.server.aet.calling", config.getLocalDicomServer().getAet());
     }
 
 }
