@@ -19,7 +19,10 @@ import org.shanoir.uploader.action.FindDicomActionListener;
 import org.shanoir.uploader.action.ImportProgressListener;
 import org.shanoir.uploader.action.event.DicomClientReadyEvent;
 import org.shanoir.uploader.dicom.DicomServerClient;
+import org.shanoir.uploader.dicom.DicomTreeNode;
+import org.shanoir.uploader.dicom.MediaMapper;
 import org.shanoir.uploader.dicom.dto.ConfigDTO;
+import org.shanoir.uploader.dicom.dto.MediaDTO;
 import org.shanoir.uploader.dicom.query.Media;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -140,11 +143,13 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
         logger.info("Patients read from DICOM server: " + media.getTreeNodes().toString());
         logger.info("Media : " + media.getData().toString());
 
-        return media.getData();
+        return MediaMapper.fromMedia(media);
     }
 
     @PostMapping("/retrieve")
     public ResponseEntity<?> retrieveDicomSeries(@RequestBody ImportJob importJob) throws Exception {
+        logger.info("Retrieving Dicom series with import job: {}", importJob);
+
         // Lock to avoid concurrent queries in parallel
         if (!importLock.tryLock()) {
             return ResponseEntity.status(HttpStatus.CONFLICT)
