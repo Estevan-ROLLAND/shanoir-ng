@@ -6,7 +6,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.locks.Lock;
+import java.util.concurrent.Semaphore;
 
 import org.shanoir.ng.importer.dicom.ImagesCreatorAndDicomFileAnalyzerService;
 import org.shanoir.ng.importer.model.ImportJob;
@@ -51,13 +51,13 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
 
     private static final Logger logger = LoggerFactory.getLogger(DicomApiController.class);
 
-    private final Lock importLock;
+    private final Semaphore importLock;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
     private final ConcurrentHashMap<String, ImportJobStatus> statusStore = new ConcurrentHashMap<>();
 
-    public DicomApiController(Lock importLock, ImagesCreatorAndDicomFileAnalyzerService dicomFileAnalyzer) {
+    public DicomApiController(Semaphore importLock, ImagesCreatorAndDicomFileAnalyzerService dicomFileAnalyzer) {
         this.importLock = importLock;
         this.dicomFileAnalyzer = new ImagesCreatorAndDicomFileAnalyzerService();
     }
@@ -147,17 +147,19 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
     }
 
     @PostMapping("/retrieve")
-    public ResponseEntity<?> retrieveDicomSeries(@RequestBody ImportJob importJob) throws Exception {
+    public ResponseEntity<?> retrieveDicomSeries(@RequestBody ImportJob importJob) {
         logger.info("Retrieving Dicom series with import job: {}", importJob);
 
-        // Lock to avoid concurrent queries in parallel
-        if (!importLock.tryLock()) {
+        // Semaphore to avoid concurrent queries in parallel
+        if (!importLock.tryAcquire()) {
+            logger.warn("Import semaphore already held, rejecting request");
             return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(Map.of("error", "A previous import is still running. Please wait until it is finished."));
         }
 
         String jobId = UUID.randomUUID().toString();
         statusStore.put(jobId, new ImportJobStatus(0, "STARTED", null, false, false));
+        logger.info("Semaphore acquired for job {}", jobId);
 
         ImportProgressListener restListener = new ImportProgressListener() {
             @Override
@@ -168,7 +170,7 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
             @Override
             public void onComplete(String reportSummary, boolean success) {
                 statusStore.put(jobId, new ImportJobStatus(100, "DONE", reportSummary, true, success));
-                importLock.unlock();
+                logger.info("Import completed for job {}", jobId);
             }
         };
 
@@ -176,14 +178,21 @@ public class DicomApiController implements ApplicationListener<DicomClientReadyE
             Map<String, ImportJob> importJobs = Map.of(importJob.getStudy().getStudyInstanceUID(), importJob);
             DownloadOrCopyRunnable runner = new DownloadOrCopyRunnable(
                     importJob.isFromPacs(), dicomServerClient, dicomFileAnalyzer,
-                    null, importJobs, restListener);
+                    null, importJobs, restListener, importLock);
             executor.submit(runner);
+            logger.info("Job {} submitted to executor", jobId);
+            return ResponseEntity.accepted().body(Map.of("importJobId", jobId));
         } catch (Exception e) {
-            importLock.unlock();
-            logger.error("An error occured while running the thread.", e);
-            return ResponseEntity.internalServerError().build();
+            logger.error("Error submitting job to executor, releasing semaphore for job {}: {}", jobId, e.getMessage(), e);
+            statusStore.remove(jobId);
+            try {
+                importLock.release();
+                logger.info("Semaphore released after error for job {}", jobId);
+            } catch (Exception releaseError) {
+                logger.error("Error releasing semaphore for job {}: {}", jobId, releaseError.getMessage(), releaseError);
+            }
+            return ResponseEntity.internalServerError().body(Map.of("error", "Failed to start import"));
         }
-    return ResponseEntity.accepted().body(Map.of("importJobId", jobId));
     }
 
     @GetMapping("/importJobs/{jobId}/progress")
